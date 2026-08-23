@@ -3155,7 +3155,7 @@ mod test {
         let Ok(mut s) = System::new() else { return };
         s.refresh_specifics(RefreshKind::everything());
 
-        if !cfg(feature = "apple-sandbox") {
+        if !cfg!(feature = "apple-sandbox") {
             // No process should have 0 as memory usage.
             assert!(!s.processes().iter().all(|(_, proc_)| proc_.memory() == 0));
         } else {
@@ -3186,7 +3186,7 @@ mod test {
         assert_eq!(s.used_swap(), 0);
 
         s.refresh_memory();
-        if !cfg(feature = "apple-sandbox") {
+        if !cfg!(feature = "apple-sandbox") {
             assert!(s.total_memory() > 0);
             assert!(s.used_memory() > 0);
             if s.total_swap() > 0 {
