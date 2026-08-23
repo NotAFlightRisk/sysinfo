@@ -67,8 +67,8 @@ impl fmt::Display for ProcessStatus {
 #[allow(dead_code)]
 #[repr(usize)]
 enum ProcIndex {
-    Pid = 0,
-    State,
+    // Pid = 0, The Pid is not parsed in `parse_stat_file`, so no need to keep this index.
+    State = 0,
     ParentPid,
     GroupId,
     SessionId,
@@ -91,9 +91,6 @@ enum ProcIndex {
     VirtualSize,
     ResidentSetSize,
     // More exist but we only use the listed ones. For more, take a look at `man proc`.
-
-    // Must ALWAYS be last!!
-    Max,
 }
 
 #[cfg(feature = "gpu")]
@@ -287,7 +284,7 @@ impl ProcessInner {
         let (data, _) = _get_stat_data_and_file(&self.proc_path).ok()?;
         let parts = parse_stat_file(&data)?;
 
-        if start_time_raw(&parts) != self.start_time_raw {
+        if parts.start_time != self.start_time_raw {
             sysinfo_debug!("Seems to not be the same process anymore");
             return None;
         }
@@ -780,23 +777,6 @@ impl<'a, T> Wrap<'a, T> {
 unsafe impl<T> Send for Wrap<'_, T> {}
 unsafe impl<T> Sync for Wrap<'_, T> {}
 
-#[inline(always)]
-fn start_time_raw(parts: &Parts<'_>) -> u64 {
-    parts
-        .str_parts
-        .get(ProcIndex::StartTime as usize)
-        .and_then(|part| parse_ascii_checked_u64(part))
-        .unwrap_or(0)
-}
-
-#[inline(always)]
-fn compute_start_time_without_boot_time(parts: &Parts<'_>, info: &SystemInfo) -> (u64, u64) {
-    let raw = start_time_raw(parts);
-    // To be noted that the start time is invalid here, it still needs to be converted into
-    // "real" time.
-    (raw, raw / info.clock_cycle)
-}
-
 fn _get_stat_data_and_file(path: &Path) -> Result<(Vec<u8>, File), ()> {
     let mut file = File::open(path.join("stat")).map_err(|_| ())?;
     let data = get_all_data_from_file(&mut file, 1024).map_err(|_| ())?;
@@ -810,12 +790,9 @@ fn _get_stat_data(path: &Path, stat_file: &mut Option<FileCounter>) -> Result<Ve
 }
 
 #[inline(always)]
-fn get_status(p: &mut ProcessInner, part: &[u8]) {
-    p.status = part
-        .get(0)
-        .copied()
-        .map(ProcessStatus::from)
-        .unwrap_or_else(|| ProcessStatus::Unknown(0));
+fn get_status(part: Option<&[u8]>) -> ProcessStatus {
+    part.and_then(|p| Some(ProcessStatus::from(*p.get(0)?)))
+        .unwrap_or(ProcessStatus::Unknown(0))
 }
 
 fn refresh_user_group_ids(
@@ -852,22 +829,23 @@ fn update_proc_info(
     parent_pid: Option<Pid>,
     refresh_kind: ProcessRefreshKind,
     proc_path: &mut PathHandler,
-    str_parts: &[&[u8]],
+    parts: &Parts<'_>,
     uptime: u64,
     info: &SystemInfo,
     #[cfg(feature = "gpu")] now: Instant,
 ) {
-    update_parent_pid(p, parent_pid, str_parts);
+    p.parent = match parent_pid {
+        Some(parent_pid) if parent_pid.0 != 0 => Some(parent_pid),
+        _ => match parts
+            .parent_pid
+            .and_then(|part| parse_ascii_checked_pid_t(part))
+        {
+            Some(p) if p.0 != 0 => Some(p),
+            _ => None,
+        },
+    };
 
-    get_status(
-        p,
-        str_parts.get(ProcIndex::State as usize).unwrap_or(
-            const {
-                const X: &[u8] = &[];
-                &X
-            },
-        ),
-    );
+    p.status = parts.status;
     refresh_user_group_ids(p, proc_path, refresh_kind);
 
     if refresh_kind.exe().needs_update(|| p.exe.is_none()) {
@@ -913,7 +891,7 @@ fn update_proc_info(
         update_optional_path(&mut p.root, proc_path.replace_and_join("root"));
     }
 
-    update_time_and_memory(proc_path, p, str_parts, uptime, info, refresh_kind);
+    update_time_and_memory(proc_path, p, &parts, uptime, info, refresh_kind);
     if refresh_kind.disk_usage() {
         update_process_disk_activity(p, proc_path);
     }
@@ -928,19 +906,6 @@ fn update_proc_info(
         self::gpu::compute_gpu_usage(proc_path, &mut p.gpu_info, now, refresh_kind);
     }
     p.updated = true;
-}
-
-fn update_parent_pid(p: &mut ProcessInner, parent_pid: Option<Pid>, str_parts: &[&[u8]]) {
-    p.parent = match parent_pid {
-        Some(parent_pid) if parent_pid.0 != 0 => Some(parent_pid),
-        _ => match str_parts
-            .get(ProcIndex::ParentPid as usize)
-            .and_then(|part| parse_ascii_checked_pid_t(part))
-        {
-            Some(p) if p.0 != 0 => Some(p),
-            _ => None,
-        },
-    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,16 +924,16 @@ fn retrieve_all_new_process_info(
     let mut proc_path = PathHandler::new(path);
     let name = parts.short_exe;
 
-    let (start_time_raw, start_time_without_boot_time) =
-        compute_start_time_without_boot_time(parts, info);
-    p.start_time_raw = start_time_raw;
-    p.start_time_without_boot_time = start_time_without_boot_time;
+    p.start_time_raw = parts.start_time;
+    // To be noted that the start time is invalid here, it still needs to be converted into
+    // "real" time.
+    p.start_time_without_boot_time = p.start_time_raw / info.clock_cycle;
     p.start_time = p
         .start_time_without_boot_time
         .saturating_add(info.boot_time);
 
     p.name = OsStr::from_bytes(name).to_os_string();
-    if let Some(part) = parts.str_parts.get(ProcIndex::Flags as usize)
+    if let Some(part) = parts.flags
         && parse_ascii_checked_culong(part)
             .is_some_and(|flags| flags & libc::PF_KTHREAD as c_ulong != 0)
     {
@@ -982,7 +947,7 @@ fn retrieve_all_new_process_info(
         parent_pid,
         refresh_kind,
         &mut proc_path,
-        &parts.str_parts,
+        &parts,
         uptime,
         info,
         #[cfg(feature = "gpu")]
@@ -1023,12 +988,11 @@ fn update_existing_process(
     entry.tasks = tasks;
 
     let parts = parse_stat_file(&data).ok_or(())?;
-    let start_time_raw = start_time_raw(&parts);
 
     // It's possible that a new process took this same PID when the "original one" terminated.
     // If the start time differs, then it means it's not the same process anymore and that we
     // need to get all its information, hence why we check it here.
-    if start_time_raw == entry.start_time_raw {
+    if parts.start_time == entry.start_time_raw {
         let mut proc_path = PathHandler::new(&entry.proc_path);
 
         // If the entry was first discovered without thread info
@@ -1042,7 +1006,7 @@ fn update_existing_process(
             parent_pid,
             refresh_kind,
             &mut proc_path,
-            &parts.str_parts,
+            &parts,
             uptime,
             info,
             #[cfg(feature = "gpu")]
@@ -1117,17 +1081,17 @@ pub(crate) fn _get_process_data(
     Ok(Some(new_process))
 }
 
-fn old_get_memory(entry: &mut ProcessInner, str_parts: &[&[u8]], info: &SystemInfo) {
+fn old_get_memory(entry: &mut ProcessInner, parts: &Parts<'_>, info: &SystemInfo) {
     // rss
-    entry.memory = str_parts
-        .get(ProcIndex::ResidentSetSize as usize)
+    entry.memory = parts
+        .resident_set_size
         .and_then(|part| parse_ascii_checked_u64(part))
         .unwrap_or(0)
         .saturating_mul(info.page_size_b);
     // vsz correspond to the Virtual memory size in bytes.
     // see: https://man7.org/linux/man-pages/man5/proc.5.html
-    entry.virtual_memory = str_parts
-        .get(ProcIndex::VirtualSize as usize)
+    entry.virtual_memory = parts
+        .virtual_size
         .and_then(|part| parse_ascii_checked_u64(part))
         .unwrap_or(0);
 }
@@ -1178,7 +1142,7 @@ fn get_memory(path: &Path, entry: &mut ProcessInner, info: &SystemInfo) -> bool 
 fn update_time_and_memory(
     path: &mut PathHandler,
     entry: &mut ProcessInner,
-    str_parts: &[&[u8]],
+    parts: &Parts<'_>,
     uptime: u64,
     info: &SystemInfo,
     refresh_kind: ProcessRefreshKind,
@@ -1188,20 +1152,10 @@ fn update_time_and_memory(
         if refresh_kind.memory() {
             // Keeping this nested level for readability reasons.
             if !get_memory(path.replace_and_join("statm"), entry, info) {
-                old_get_memory(entry, str_parts, info);
+                old_get_memory(entry, parts, info);
             }
         }
-        set_time(
-            entry,
-            str_parts
-                .get(ProcIndex::UserTime as usize)
-                .and_then(|part| parse_ascii_checked_u64(part))
-                .unwrap_or(0),
-            str_parts
-                .get(ProcIndex::SystemTime as usize)
-                .and_then(|part| parse_ascii_checked_u64(part))
-                .unwrap_or(0),
-        );
+        set_time(entry, parts.user_time, parts.system_time);
         entry.run_time = uptime.saturating_sub(entry.start_time_without_boot_time);
     }
 }
@@ -1476,7 +1430,14 @@ fn get_tgid(file_path: &Path) -> Option<Pid> {
 }
 
 struct Parts<'a> {
-    str_parts: Vec<&'a [u8]>,
+    parent_pid: Option<&'a [u8]>,
+    flags: Option<&'a [u8]>,
+    virtual_size: Option<&'a [u8]>,
+    resident_set_size: Option<&'a [u8]>,
+    user_time: u64,
+    system_time: u64,
+    start_time: u64,
+    status: ProcessStatus,
     short_exe: &'a [u8],
 }
 
@@ -1490,19 +1451,47 @@ fn parse_stat_file(data: &[u8]) -> Option<Parts<'_>> {
     // in the entire string. All other fields are delimited by
     // whitespace.
 
-    let mut str_parts = Vec::with_capacity(ProcIndex::Max as usize);
-    let mut data_it = data.splitn(2, |&b| b == b' ');
-    str_parts.push(data_it.next()?);
-    let mut data_it = data_it.next()?.splitn(2, |&b| b == b')');
+    let data_it = data.splitn(2, |&b| b == b' ');
+    // Skipping the pid.
+    let mut data_it = data_it.skip(1).next()?.splitn(2, |&b| b == b')');
     let short_exe = data_it.next()?;
     let data = data_it.next()?;
-    str_parts.extend(
-        data.split(|c| *c == b' ' || *c == b'\t')
-            .filter(|d| !d.is_empty())
-            .take(ProcIndex::Max as usize),
-    );
+    let data = data
+        .split(|c| *c == b' ' || *c == b'\t')
+        .filter(|d| !d.is_empty());
+
+    // We only retrieve the fields we're interested into. The code is very ugly though. Not too sure
+    // how to improve it...
+    let mut data = data.skip(ProcIndex::State as usize);
+    let status = get_status(data.next());
+    let parent_pid = data.next();
+    let mut data = data.skip(ProcIndex::Flags as usize - ProcIndex::ParentPid as usize - 1);
+    let flags = data.next();
+    let mut data = data.skip(ProcIndex::Flags as usize - ProcIndex::ParentPid as usize - 1);
+    let user_time = data
+        .next()
+        .and_then(|d| parse_ascii_checked_u64(d))
+        .unwrap_or(0);
+    let system_time = data
+        .next()
+        .and_then(|d| parse_ascii_checked_u64(d))
+        .unwrap_or(0);
+    let mut data = data.skip(ProcIndex::StartTime as usize - ProcIndex::SystemTime as usize - 1);
+    let start_time = data
+        .next()
+        .and_then(|d| parse_ascii_checked_u64(d))
+        .unwrap_or(0);
+    let virtual_size = data.next();
+    let resident_set_size = data.next();
     Some(Parts {
-        str_parts,
+        parent_pid,
+        flags,
+        virtual_size,
+        resident_set_size,
+        user_time,
+        system_time,
+        start_time,
+        status,
         short_exe: short_exe.strip_prefix(b"(").unwrap_or(short_exe),
     })
 }
